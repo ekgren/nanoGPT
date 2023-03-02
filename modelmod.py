@@ -15,7 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
+from optim import Lion
+
 def new_gelu(x):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
@@ -23,26 +24,54 @@ def new_gelu(x):
     """
     return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-
-    def __init__(self, ndim, bias):
+class Act(nn.Module):
+    def __init__(self, n_state):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.weight = nn.Parameter(torch.ones(n_state), requires_grad=True)
+        # self.bias = nn.Parameter(torch.zeros(n_state), requires_grad=True)
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    def forward(self, x):
+        # n = 0.1
+        # out = (x % n) + x.sign()
+        # return out * self.weight + self.bias
+        return 0.5 * x * (self.weight + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0)))) # + self.bias
+        
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, n_state, bias=False, eps=1e-5):
+        super(LayerNorm, self).__init__()
+        self.n_state = n_state
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(n_state), requires_grad=True)
+        # self.bias = nn.Parameter(torch.zeros(n_state))
+
+    def forward(self, x):
+        s = (x).pow(2).mean(-1, keepdim=True)
+        x = (x) / torch.sqrt(s + self.eps)
+        return self.weight * x # + self.bias
 
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=True)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=True)
+        
+        # MLP output projection
+        self.c_proj_mlp  = nn.Linear(3 * config.n_embd, config.n_embd, bias=True)
+        self.act = Act(3 * config.n_embd)
+        
+        # LayerNorms
+        self.ln_1 = LayerNorm(config.n_embd)
+        self.ln_2 = LayerNorm(config.n_embd)
+        self.ln_3 = LayerNorm(config.n_embd)
+        self.ln_4 = LayerNorm(config.n_embd)
+
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -51,21 +80,27 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch nightly and still a bit scary
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and self.dropout == 0.0
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention atm needs PyTorch nightly and dropout=0.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        x_proj = self.c_attn(x)
+        #x_mlp = self.c_proj_mlp(new_gelu(x_proj))
+        x_mlp = self.c_proj_mlp(self.act(x_proj))
+
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k ,v  = x_proj.split(self.n_embd, dim=2)
+        q = self.ln_1(q)
+        k = self.ln_2(k)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
+        
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
@@ -80,36 +115,18 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.ln_3(self.resid_dropout(self.c_proj(y))) + self.ln_4(x_mlp)
         return y
-
-class MLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = new_gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -278,7 +295,7 @@ class GPT(nn.Module):
         decay = set()
         no_decay = set()
         whitelist_weight_modules = (torch.nn.Linear, )
-        blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
+        blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding, Act)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
@@ -320,8 +337,8 @@ class GPT(nn.Module):
         use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
         print(f"using fused AdamW: {use_fused}")
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        # optimizer = Lion(optim_groups, lr=learning_rate, betas=betas)
+        # optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = Lion(optim_groups, lr=learning_rate, betas=betas)
 
         return optimizer
 
