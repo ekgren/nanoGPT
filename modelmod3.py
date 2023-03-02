@@ -138,9 +138,11 @@ class Block(nn.Module):
         super().__init__()
         self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
+        self.c_proj1 = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj2 = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x, freqs_cis):
-        x = x + self.attn(self.ln_1(x), freqs_cis=freqs_cis)
+        x = F.silu(self.c_proj1(x)) * self.c_proj2(x) + self.attn(self.ln_1(x), freqs_cis=freqs_cis)
         return x
 
 @dataclass
